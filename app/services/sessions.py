@@ -18,8 +18,9 @@ def set_session_cookie(resp: Response, token: str, minutes: int = 60*24*7):
         key=COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=False,  # set True in production (https)
+        secure=True,  # set True in production (https)
         samesite="lax",
+        domain=".neuroflowai.co.uk",
         max_age=minutes * 60,
         path="/",
     )
