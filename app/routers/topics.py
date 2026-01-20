@@ -39,12 +39,7 @@ def create_topics(payload: dict, db: Session = Depends(get_db)):
     if not isinstance(content_types, list) or len(content_types) == 0:
         raise HTTPException(status_code=400, detail="content_types must be a non-empty list")
 
-    allowed_platforms = {"facebook", "instagram", "linkedin"}
     allowed_types = {"text", "image", "video"}
-
-    for p in platforms:
-        if p not in allowed_platforms:
-            raise HTTPException(status_code=400, detail=f"Invalid platform: {p}")
 
     for ct in content_types:
         if ct not in allowed_types:
