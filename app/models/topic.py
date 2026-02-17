@@ -17,3 +17,4 @@ class Topic(Base):
     )
     topic_text: Mapped[str] = mapped_column(String(1000), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    

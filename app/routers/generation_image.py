@@ -92,7 +92,6 @@ def generate_images(
                 "brand_id": it.brand_id,
                 "platform": it.platform,
                 "prompt": prompt,
-                # you can use this inside Make to decide size/aspect ratio:
                 "aspect_hint": "square" if it.platform in ("instagram", "facebook") else "landscape",
             }
         )

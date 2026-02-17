@@ -7,10 +7,12 @@ import uuid
 from datetime import datetime
 from typing import Any, List, Optional
 
+import boto3
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from botocore.config import Config
 
 from app.database import get_db
 from app.models.content_item import ContentItem
@@ -170,6 +172,7 @@ def generate_media_for_items(payload: dict, db: Session = Depends(get_db)) -> di
                         "content_item_id": str(it.id),
                         "brand_id": it.brand_id,
                         "platform": it.platform,
+                        "media_Url":it.media_url,
                         "content_type": ct,
                         "status":it.status,
                         "prompt": prompt,
@@ -225,3 +228,79 @@ def generate_media_for_items(payload: dict, db: Session = Depends(get_db)) -> di
             continue
 
     return {"sent": sent, "updated": updated, "skipped": len(skipped), "skipped_items": skipped}
+
+def _get_s3_client():
+    key = (os.getenv("DO_SPACES_KEY") or "").strip()
+    secret = (os.getenv("DO_SPACES_SECRET") or "").strip()
+    region = (os.getenv("DO_SPACES_REGION") or "").strip()
+    endpoint = (os.getenv("DO_SPACES_ENDPOINT") or "").strip()
+
+    if not key or not secret or not region or not endpoint:
+        raise HTTPException(status_code=500, detail="Spaces env vars missing (DO_SPACES_KEY/SECRET/REGION/ENDPOINT)")
+
+    session = boto3.session.Session()
+    return session.client(
+        "s3",
+        region_name=region,
+        endpoint_url=endpoint,
+        aws_access_key_id=key,
+        aws_secret_access_key=secret,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+@router.post("/upload")
+async def upload_media(file: UploadFile = File(...)):
+    """
+    Uploads an image/video to DigitalOcean Spaces and returns a public URL.
+    Frontend uses this, then PATCHes content-item media_url.
+    """
+    bucket = (os.getenv("DO_SPACES_BUCKET") or "").strip()
+    cdn_base = (os.getenv("DO_SPACES_CDN_BASE") or "").strip()
+
+    if not bucket:
+        raise HTTPException(status_code=500, detail="DO_SPACES_BUCKET missing")
+    if not cdn_base:
+        raise HTTPException(status_code=500, detail="DO_SPACES_CDN_BASE missing")
+
+    content_type = (file.content_type or "").lower()
+    if not content_type:
+        raise HTTPException(status_code=400, detail="File content_type missing")
+
+    # allow common media types only
+    ok_prefixes = ("image/", "video/")
+    if not content_type.startswith(ok_prefixes):
+        raise HTTPException(status_code=400, detail="Only image/* or video/* files allowed")
+
+    ext = ""
+    if file.filename and "." in file.filename:
+        ext = "." + file.filename.split(".")[-1].lower()
+
+    # folder structure
+    # e.g. uploads/2026/01/uuid.jpg
+    now = datetime.utcnow()
+    key_name = f"uploads/{now.year}/{str(now.month).zfill(2)}/{uuid.uuid4().hex}{ext}"
+
+    s3 = _get_s3_client()
+
+    try:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        s3.put_object(
+            Bucket=bucket,
+            Key=key_name,
+            Body=data,
+            ACL="public-read",
+            ContentType=content_type,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+    # public url
+    url = f"{cdn_base.rstrip('/')}/{key_name}"
+    return {"url": url, "key": key_name}

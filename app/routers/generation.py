@@ -1,130 +1,158 @@
 # backend/app/routers/generation.py
-from __future__ import annotations
-
-from datetime import datetime
-from typing import List, Optional, Any
-
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+import uuid
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.content_item import ContentItem
+from app.models.content_draft import ContentDraft
 from app.services.ai_generator import generate_post
-from app.services.state_machine import ensure_transition
 
 router = APIRouter(prefix="/generation", tags=["generation"])
 
-
 class GenerateDraftsRequest(BaseModel):
-    content_item_ids: Optional[List[str]] = None
-    mode: Optional[str] = None  # "rejected" | "new" | None
-    platform: Optional[str] = None
-    content_type: Optional[str] = None  # "text" | "image" | "video" | None
-    brand_id: str = "neuroflow-ai"
+    brand_id: str
+    mode: str = Field(default="new")  # "new" | "rejected" | "monthly"
+    platforms: list[str] | None = None
+    target_month: str | None = None
+    posts_per_week: int | None = None
+    brand_profile_summary: str | None = None
+    brand_profile_json: object | None = None
+    client_now: Optional[str] = None   # ISO string from browser
+    timezone: Optional[str] = None     # "Europe/London"
+    posting_hour_local: Optional[int] = 9
 
-    # ✅ scraped brand context
-    brand_profile_summary: Optional[str] = None
-    brand_profile_json: Optional[Any] = None
-
-
-def _normalize_content_type(x: Optional[str]) -> Optional[str]:
-    if not x:
+def _parse_iso_utc(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
         return None
-    v = str(x).strip().lower()
-    if v in ("text", "image", "video"):
-        return v
-    return None
+    try:
+        iso = str(dt_str).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
+def _parse_client_now(client_now: Optional[str]) -> datetime:
+    # default to utc now if missing
+    if not client_now:
+        return datetime.now(timezone.utc)
+    try:
+        dt = datetime.fromisoformat(client_now.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
 
-@router.post("/text")  # keep same route to avoid breaking frontend
+def _bump_if_past(scheduled_utc: Optional[datetime], min_utc: datetime) -> Optional[datetime]:
+    if not scheduled_utc:
+        return None
+    if scheduled_utc < min_utc:
+        # bump to +60 minutes from client_now (simple V1 rule)
+        return (min_utc + timedelta(minutes=60)).replace(second=0, microsecond=0)
+    return scheduled_utc
+
+@router.post("/text")
 def generate_drafts(payload: GenerateDraftsRequest, db: Session = Depends(get_db)):
-    wanted_type = _normalize_content_type(payload.content_type)
+    now = datetime.utcnow()  # ✅ keep consistent (naive UTC)
 
     q = select(ContentItem).where(ContentItem.brand_id == payload.brand_id)
 
-    if payload.platform:
-        q = q.where(ContentItem.platform == payload.platform)
+    if payload.platforms:
+        q = q.where(ContentItem.platform.in_(payload.platforms))
 
-    # If caller specifies a type, filter by it. Otherwise generate for all types.
-    if wanted_type:
-        q = q.where(ContentItem.content_type == wanted_type)
-    else:
-        q = q.where(ContentItem.content_type.in_(["text", "image", "video"]))
+    q = q.where(ContentItem.status == "TOPIC_INGESTED")
 
-    # Select items by ids or by mode
-    if payload.content_item_ids:
-        q = q.where(ContentItem.id.in_(payload.content_item_ids))
-    elif payload.mode == "rejected":
-        q = q.where(ContentItem.status == "REJECTED")
-    else:
-        # default/new
-        q = q.where(ContentItem.status == "TOPIC_INGESTED")
+    if payload.mode == "monthly" and payload.target_month and hasattr(ContentItem, "plan_month"):
+        q = q.where(ContentItem.plan_month == payload.target_month)
 
     items = db.execute(q).scalars().all()
+    if not items:
+        return {"created": 0, "generated": 0, "note": "No matching content_items found."}
 
-    updated = 0
-    now = datetime.utcnow()
+    generated = 0
+    failed = 0
 
     for it in items:
-        ct = _normalize_content_type(it.content_type) or "text"
-
-        # safety: only allow the 3 types in this flow
-        if ct not in ("text", "image", "video"):
-            continue
-
-        # Move to GENERATING
-        try:
-            ensure_transition(it.status, "GENERATING")
-        except Exception:
-            # skip items in invalid state
-            continue
-
-        it.status = "GENERATING"
-        it.updated_at = now
-        it.last_error = None
-        db.commit()
-
-        topic_text = (it.title or "").strip() or "Untitled topic"
+        topic_text = (getattr(it, "topic", None) or "").strip() or "Untitled topic"
 
         try:
             result = generate_post(
                 topic_text=topic_text,
                 platform=it.platform,
                 brand_id=payload.brand_id,
-                content_type=ct,
                 brand_profile_summary=payload.brand_profile_summary,
                 brand_profile_json=payload.brand_profile_json,
+                target_month=payload.target_month,
+                posts_per_week=payload.posts_per_week,
+                client_now_utc_iso=payload.client_now,
+                timezone=payload.timezone or "Europe/London",
+                posting_hour_local=payload.posting_hour_local or 9,
             )
 
+            # ✅ define structured FIRST
+            structured = result.get("structured") or {}
+
+            # ✅ normalize caption
             caption = (result.get("body_text") or "").strip()
-            hashtags = (result.get("hashtags") or "").strip()
-            media_prompt = (result.get("media_prompt") or "").strip()
 
-            # ✅ Store prompt INSIDE body_text for image/video
-            if ct in ("image", "video") and media_prompt:
-                # Keep it readable + obvious in approvals UI
-                caption = (
-                    f"{caption}\n\n"
-                    f"---\n"
-                    f"{'IMAGE_PROMPT' if ct == 'image' else 'VIDEO_PROMPT'}:\n"
-                    f"{media_prompt}\n"
-                ).strip()
+            # ✅ normalize hashtags (list or string)
+            h = result.get("hashtags") or structured.get("hashtags") or ""
+            if isinstance(h, list):
+                hashtags = " ".join([str(x).strip() for x in h if str(x).strip()]).strip()
+            else:
+                hashtags = str(h).strip()
 
-            it.body_text = caption
-            it.hashtags = hashtags or None
-            it.status = "PENDING_APPROVAL"
+            # ✅ client now in UTC (aware)
+            client_now_utc = _parse_client_now(payload.client_now)
+
+            # ✅ scheduled_at from AI (either top-level or in structured)
+            ai_scheduled = result.get("scheduled_at") or structured.get("scheduled_at")
+            dt_utc = _parse_iso_utc(ai_scheduled) if ai_scheduled else None
+
+            # ✅ bump if AI schedules in the past vs client time
+            dt_utc = _bump_if_past(dt_utc, client_now_utc)
+
+            # ✅ store naive UTC if DB column is "timestamp without time zone"
+            scheduled_dt = dt_utc.replace(tzinfo=None) if dt_utc else None
+
+            # ✅ create draft (NOW draft exists)
+            draft = ContentDraft(
+                id=uuid.uuid4(),
+                content_item_id=it.id,
+                status="PENDING_APPROVAL",
+                body_text=caption or None,
+                hashtags=hashtags or None,
+                scheduled_at=scheduled_dt,          # ✅ uses bumped time
+                structured=structured or None,
+                last_error=None,
+                updated_at=now,
+            )
+            db.add(draft)
+
+            it.status = "HAS_DRAFT"
             it.updated_at = now
-            it.last_error = None
-            db.commit()
 
-            updated += 1
+            generated += 1
 
         except Exception as e:
-            it.status = "FAILED"
-            it.last_error = str(e)
-            it.updated_at = now
-            db.commit()
+            failed += 1
+            db.rollback()  # ✅ important: reset failed transaction
 
-    return {"generated": updated}
+            # ⚠️ Only create FAILED draft if your table allows null body_text/hashtags/etc
+            db.add(ContentDraft(
+                id=uuid.uuid4(),
+                content_item_id=it.id,
+                status="FAILED",
+                last_error=str(e),
+                updated_at=now,
+            ))
+
+    db.commit()
+    return {"created": len(items), "generated": generated, "failed": failed}

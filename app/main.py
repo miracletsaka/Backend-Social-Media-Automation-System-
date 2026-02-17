@@ -9,6 +9,7 @@ from app.routers import platforms
 from app.routers import stats
 from app.routers import schedule
 from app.routers import publisher
+from app.routers import bulk_calendar
 from app.routers import export
 from app.routers import publishing
 from app.routers import make_bridge
@@ -17,6 +18,12 @@ from app.routers import generation_image
 from app.routers import brand_profiles
 from app.routers.auth import router as auth_router
 from app.routers import admin_users
+from app.routers import planner
+from app.routers import topic_chats
+from app.routers import drafts
+from app.routers import content_drafts
+from app.routers import templates
+
 # Create FastAPI app FIRST
 app = FastAPI(title="AI Marketing System")
 # Enable CORS (required for Next.js frontend)
@@ -52,7 +59,10 @@ app.include_router(generation_image.router)
 app.include_router(brand_profiles.router)
 app.include_router(auth_router)
 app.include_router(admin_users.router)
-
+app.include_router(topic_chats.router)
+app.include_router(drafts.router)
+app.include_router(content_drafts.router)
+app.include_router(templates.router)
 # Health check
 @app.get("/")
 def health_check():

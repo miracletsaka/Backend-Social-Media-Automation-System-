@@ -1,10 +1,7 @@
-# backend/app/routers/topics.py
-from __future__ import annotations
-
-import uuid
 from datetime import datetime
-
+import uuid
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -12,75 +9,45 @@ from app.models.content_item import ContentItem
 
 router = APIRouter(prefix="/topics", tags=["topics"])
 
+  # ✅ NOT "/topics"
 
-@router.post("")
-def create_topics(payload: dict, db: Session = Depends(get_db)):
-    """
-    Creates ContentItems for each topic x platform x content_type.
+class CreateTopicsRequest(BaseModel):
+    topics: list[str]
+    brand_id: str
+    platforms: list[str]
+    plan_month: str          # "YYYY-MM"
+    times_per_week: int
 
-    payload:
-      {
-        "topics": ["..."],
-        "brand_id": "neuroflow-ai",
-        "platforms": ["facebook","instagram","linkedin"],
-        "content_types": ["text","image","video"]
-      }
-    """
-
-    topics = payload.get("topics") or []
-    brand_id = (payload.get("brand_id") or "neuroflow-ai").strip()
-    platforms = payload.get("platforms") or []
-    content_types = payload.get("content_types") or []
-
-    if not isinstance(topics, list) or len(topics) == 0:
-        raise HTTPException(status_code=400, detail="topics must be a non-empty list")
-    if not isinstance(platforms, list) or len(platforms) == 0:
-        raise HTTPException(status_code=400, detail="platforms must be a non-empty list")
-    if not isinstance(content_types, list) or len(content_types) == 0:
-        raise HTTPException(status_code=400, detail="content_types must be a non-empty list")
-
-    allowed_types = {"text", "image", "video"}
-
-    for ct in content_types:
-        if ct not in allowed_types:
-            raise HTTPException(status_code=400, detail=f"Invalid content_type: {ct}")
-
-    created = 0
+@router.post("") 
+def create_topics(payload: CreateTopicsRequest, db: Session = Depends(get_db)):
     now = datetime.utcnow()
 
-    for t in topics:
-        topic_text = (t or "").strip()
-        if not topic_text:
+    if not payload.topics:
+        raise HTTPException(status_code=400, detail="topics is required")
+    if not payload.platforms:
+        raise HTTPException(status_code=400, detail="platforms is required")
+
+    created = 0
+
+    for topic in payload.topics:
+        t = (topic or "").strip()
+        if not t:
             continue
 
-        topic_id = uuid.uuid4()  # we use a UUID for topic_id grouping
-
-        for platform in platforms:
-            for ct in content_types:
-                item = ContentItem(
-                    topic_id=topic_id,
-                    brand_id=brand_id,
-                    platform=platform,
-                    content_type=ct,
-                    status="TOPIC_INGESTED",
-                    title=topic_text[:300],
-                    body_text=None,       # caption generated later
-                    hashtags=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-
-                # Media defaults (safe even if DB columns exist)
-                # For image/video, set media_type early so UI can understand intent.
-                if ct in ("image", "video"):
-                    item.media_type = ct
-                    item.media_caption = None
-                    item.media_url = None
-                    item.thumbnail_url = None
-                    item.media_provider = None
-
-                db.add(item)
-                created += 1
+        for plat in payload.platforms:
+            item = ContentItem(
+                id=uuid.uuid4(),
+                brand_id=payload.brand_id,
+                platform=plat,
+                topic=t,
+                plan_month=payload.plan_month,
+                times_per_week=payload.times_per_week,
+                status="TOPIC_INGESTED",
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(item)
+            created += 1
 
     db.commit()
     return {"content_items_created": created}

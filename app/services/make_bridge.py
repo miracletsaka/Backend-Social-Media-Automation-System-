@@ -12,14 +12,15 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.content_item import ContentItem
+from backend.app.services.formatters.platform_text import build_structured_text
 
 router = APIRouter(prefix="/make", tags=["make"])
 
 
 def _parse_ids(payload: dict) -> list[uuid.UUID]:
-    ids = payload.get("content_item_ids", [])
+    ids = payload.get("draft_ids", [])
     if not ids:
-        raise HTTPException(status_code=400, detail="content_item_ids is required")
+        raise HTTPException(status_code=400, detail="draft_ids is required")
     try:
         return [uuid.UUID(x) for x in ids]
     except Exception:
@@ -50,9 +51,12 @@ def send_to_make(payload: dict, db: Session = Depends(get_db)):
     skipped: list[dict[str, Any]] = []
 
     for it in items:
-        # strict: only QUEUED can be sent to Make
-        if it.status != "QUEUED":
-            skipped.append({"id": str(it.id), "status": it.status, "reason": "Only QUEUED items can be sent to Make"})
+        if not it.scheduled_at:
+            skipped.append({
+                "id": str(it.id),
+                "status": it.status,
+                "reason": "Missing scheduled_at. Select a month/time and schedule first."
+            })
             continue
 
         caption = (it.body_text or "").strip()
@@ -66,20 +70,29 @@ def send_to_make(payload: dict, db: Session = Depends(get_db)):
                 skipped.append({"id": str(it.id), "status": it.status, "reason": "Missing media_url for image/video"})
                 continue
 
-        to_send.append(
-            {
-                "content_item_id": str(it.id),
-                "brand_id": it.brand_id,
-                "platform": it.platform,
-                "content_type": it.content_type,
-                "caption": caption,
-                "hashtags": (it.hashtags or "").strip() or None,
-                "media_url": it.media_url,
-                "media_type": it.media_type,
-                "thumbnail_url": it.thumbnail_url,
-                "scheduled_at": it.scheduled_at.isoformat() if it.scheduled_at else None,
-            }
-        )
+        text = build_structured_text(it).strip()
+        if not text:
+            skipped.append({"id": str(it.id), "status": it.status, "reason": "Empty text"})
+            continue
+
+        to_send.append({
+            "content_item_id": str(it.id),
+            "brand_id": it.brand_id,
+            "platform": it.platform,
+            "content_type": (it.content_type or "").lower().strip(),
+
+            # Buffer scheduling
+            "scheduled_at": it.scheduled_at.isoformat(),
+
+            # Buffer Text
+            "text": text,
+
+            # Media (only if image/video)
+            "image_url": it.media_url if (it.content_type == "image") else None,
+            "media_url": it.media_url,
+            "thumbnail_url": it.thumbnail_url,
+        })
+
 
     if not to_send:
         return {"sent": 0, "skipped": len(skipped), "skipped_items": skipped}
